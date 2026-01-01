@@ -6,6 +6,7 @@ from typing import Optional, List
 import pandas as pd
 import json
 import duckdb
+import os
 import uuid
 from pathlib import Path
 from openai import OpenAI
@@ -225,40 +226,39 @@ def create_chart(config: dict) -> str:
 
 
 def execute_visualization_code(code: str, data_str: str, session_id: str) -> Optional[str]:
-    """Execute the visualization code and save to file, return URL path"""
     try:
-        # Get the original dataset from the session instead of parsing the string
         session = active_sessions.get(session_id)
         if not session or "dataset_path" not in session:
             print("Error: No dataset found in session")
             return None
-        
-        # Read the full dataset
+
         df = pd.read_csv(session["dataset_path"])
-        
-        # Create a new figure
+
         plt.figure(figsize=(10, 6))
-        
-        # Execute the visualization code
-        exec_globals = {"df": df, "plt": plt, "pd": pd}
+
+        exec_globals = {
+            "df": df,
+            "plt": plt,
+            "pd": pd,
+            "config": extract_chart_config(data_str, "auto")  # 🔥 ADD THIS
+        }
+
         exec(code, exec_globals)
-        
-        # Generate unique filename
+
         chart_filename = f"chart_{uuid.uuid4()}.png"
         chart_path = CHARTS_DIR / chart_filename
-        
-        # Save the plot to file
-        plt.savefig(chart_path, format='png', bbox_inches='tight', dpi=100)
-        plt.close('all')  # Close all figures to free memory
-        
-        # Return the URL path
+
+        plt.savefig(chart_path, format="png", bbox_inches="tight", dpi=100)
+        plt.close("all")
+
         return f"/charts/{chart_filename}"
-        
+
     except Exception as e:
         print(f"Error executing visualization code: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
+
 
 
 def generate_visualization(data: str, visualization_goal: str, session_id: str) -> tuple[str, Optional[str]]:
@@ -379,31 +379,69 @@ def run_agent_with_data(messages, session_id):
     visualization_code = None
     all_chart_urls = []
     
-    while True:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=tools, # type: ignore
-        )
+    max_iterations = 10  # Prevent infinite loops
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
         
-        messages.append(response.choices[0].message)
-        tool_calls = response.choices[0].message.tool_calls
+        try:
+            # Convert messages to proper format for API
+            api_messages = []
+            for msg in messages:
+                if isinstance(msg, dict):
+                    api_messages.append(msg)
+                else:
+                    # Handle case where message might be an object
+                    api_messages.append({
+                        "role": getattr(msg, "role", "user"),
+                        "content": getattr(msg, "content", str(msg))
+                    })
+            
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=api_messages,
+                tools=tools, # type: ignore
+            )
+            
+            # Convert response message to dict before appending
+            response_msg = response.choices[0].message
+            msg_dict = {
+                "role": response_msg.role,
+                "content": response_msg.content
+            }
+            
+            # Add tool_calls if they exist
+            if response_msg.tool_calls:
+                msg_dict["tool_calls"] = response_msg.tool_calls
+            
+            messages.append(msg_dict)
+            tool_calls = response_msg.tool_calls
 
-        if tool_calls:
-            messages, chart_urls = handle_tool_calls(tool_calls, messages, session_id)
-            
-            # Collect all generated chart URLs
-            if chart_urls:
-                all_chart_urls.extend(chart_urls)
-            
-            # Check if visualization was generated (for backward compatibility)
-            for tool_call in tool_calls:
-                if tool_call.function.name == "generate_visualization": # type: ignore
-                    function_args = json.loads(tool_call.function.arguments) # type: ignore
-                    code, _ = generate_visualization(**function_args)
-                    visualization_code = code
-        else:
-            return response.choices[0].message.content, visualization_code, all_chart_urls
+            if tool_calls:
+                messages, chart_urls = handle_tool_calls(tool_calls, messages, session_id)
+                
+                # Collect all generated chart URLs
+                if chart_urls:
+                    all_chart_urls.extend(chart_urls)
+                
+                # Check if visualization was generated (for backward compatibility)
+                for tool_call in tool_calls:
+                    if tool_call.function.name == "generate_visualization": # type: ignore
+                        function_args = json.loads(tool_call.function.arguments) # type: ignore
+                        code, _ = generate_visualization(session_id=session_id, **function_args)
+                        visualization_code = code
+            else:
+                return response_msg.content, visualization_code, all_chart_urls
+                
+        except Exception as e:
+            print(f"Error in agent iteration {iteration}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Return whatever we have so far
+            return f"Error processing request: {str(e)}", visualization_code, all_chart_urls
+    
+    return "Maximum iterations reached", visualization_code, all_chart_urls
 
 
 def run_agent_general(messages):
@@ -479,17 +517,24 @@ async def chat(request: ChatRequest):
             session["messages"].append({"role": "user", "content": request.message})
             
             # Run agent with data tools
-            response_text, viz_code, chart_urls = run_agent_with_data(
-                session["messages"].copy(), 
-                request.session_id
-            )
+            try:
+                response_text, viz_code, chart_urls = run_agent_with_data(
+                    session["messages"].copy(), 
+                    request.session_id
+                )
+            except Exception as agent_error:
+                print(f"Agent error: {str(agent_error)}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Agent processing error: {str(agent_error)}")
             
             # Update conversation history
-            session["messages"].append({"role": "assistant", "content": response_text})
+            if response_text:
+                session["messages"].append({"role": "assistant", "content": response_text})
             
             return ChatResponse(
                 session_id=request.session_id,
-                response=response_text, # type: ignore
+                response=response_text if response_text else "I encountered an error processing your request.",
                 visualization_code=viz_code,
                 chart_urls=chart_urls if chart_urls else None,
                 mode="data_analysis"
@@ -506,20 +551,32 @@ async def chat(request: ChatRequest):
             temp_session["messages"].append({"role": "user", "content": request.message})
             
             # Run agent in general mode
-            response_text, viz_code, chart_urls = run_agent_general(temp_session["messages"].copy())
+            try:
+                response_text, viz_code, chart_urls = run_agent_general(temp_session["messages"].copy())
+            except Exception as agent_error:
+                print(f"Agent error: {str(agent_error)}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Agent processing error: {str(agent_error)}")
             
             # Update conversation history
-            temp_session["messages"].append({"role": "assistant", "content": response_text})
+            if response_text:
+                temp_session["messages"].append({"role": "assistant", "content": response_text})
             
             return ChatResponse(
                 session_id=temp_session_id,
-                response=response_text, # type: ignore
+                response=response_text if response_text else "I encountered an error processing your request.",
                 visualization_code=viz_code,
                 chart_urls=None,
                 mode="general"
             )
     
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Unexpected error in chat endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
 
 
