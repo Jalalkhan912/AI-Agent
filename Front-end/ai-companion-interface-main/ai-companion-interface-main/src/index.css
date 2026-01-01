@@ -125,17 +125,21 @@
     @apply bg-transparent p-0;
   }
   
+  .markdown-content .table-wrapper {
+    @apply overflow-auto max-h-[280px] my-4;
+  }
+
   .markdown-content table {
-    @apply w-full border-collapse my-4 text-sm;
+    @apply w-full border-collapse text-sm;
   }
   
   .markdown-content th,
   .markdown-content td {
-    @apply border border-border px-3 py-2 text-left;
+    @apply border border-border px-3 py-2 text-left whitespace-nowrap;
   }
   
   .markdown-content th {
-    @apply bg-muted font-medium;
+    @apply bg-muted font-medium sticky top-0;
   }
   
   .markdown-content tr:nth-child(even) {

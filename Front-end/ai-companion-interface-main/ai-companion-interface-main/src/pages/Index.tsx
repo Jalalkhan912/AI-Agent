@@ -2,7 +2,8 @@ import { useRef, useEffect } from 'react';
 import { ChatMessage } from '@/components/ChatMessage';
 import { ChatInput } from '@/components/ChatInput';
 import { useChat } from '@/hooks/useChat';
-import { Loader2 } from 'lucide-react';
+import { Loader2, Plus } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 
 const Index = () => {
   const {
@@ -12,6 +13,7 @@ const Index = () => {
     sendMessage,
     uploadFile,
     clearSession,
+    clearMessages,
   } = useChat();
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -24,11 +26,6 @@ const Index = () => {
 
   return (
     <div className="flex flex-col h-screen bg-background">
-      {/* Header */}
-      <header className="bg-header px-6 py-3">
-        <h1 className="text-primary-foreground font-medium">CSV Agent</h1>
-      </header>
-
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-hidden">
         {!hasMessages ? (
@@ -53,11 +50,24 @@ const Index = () => {
           <>
             <div className="flex-1 overflow-y-auto px-4 py-6">
               <div className="max-w-3xl mx-auto space-y-4">
+                {/* New Chat Button */}
+                <div className="flex justify-end mb-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={clearMessages}
+                    className="gap-2"
+                  >
+                    <Plus className="w-4 h-4" />
+                    New Chat
+                  </Button>
+                </div>
                 {messages.map((message) => (
                   <ChatMessage
                     key={message.id}
                     role={message.role}
                     content={message.content}
+                    chartUrls={message.chartUrls}
                   />
                 ))}
                 {isLoading && (

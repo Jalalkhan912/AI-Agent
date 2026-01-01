@@ -1,15 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional, List
 import pandas as pd
 import json
 import duckdb
-import os
 import uuid
 from pathlib import Path
 from openai import OpenAI
 import shutil
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 from helper import get_openai_api_key
 
 # Initialize FastAPI app
@@ -32,9 +35,15 @@ app.add_middleware(
 client = OpenAI(api_key=get_openai_api_key())
 MODEL = "gpt-4o-mini"
 
-# Directory to store uploaded files
+# Directory to store uploaded files and generated charts
 UPLOAD_DIR = Path("uploaded_datasets")
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+CHARTS_DIR = Path("generated_charts")
+CHARTS_DIR.mkdir(exist_ok=True)
+
+# Mount the charts directory to serve static files
+app.mount("/charts", StaticFiles(directory=str(CHARTS_DIR)), name="charts")
 
 # Store active sessions (in production, use Redis or a proper database)
 active_sessions = {}
@@ -50,6 +59,7 @@ class ChatResponse(BaseModel):
     session_id: Optional[str] = None
     response: str
     visualization_code: Optional[str] = None
+    chart_urls: Optional[List[str]] = None  # URLs to chart images
     mode: str  # "general" or "data_analysis"
 
 
@@ -90,6 +100,8 @@ CREATE_CHART_PROMPT = """
 Write python code to create a chart based on the following configuration.
 Only return the code, no other text.
 Use matplotlib and pandas. The data is already loaded as a pandas DataFrame called 'df'.
+The code should create the plot but NOT call plt.show() or plt.savefig().
+Just create the figure and plot, we'll handle saving it.
 config: {config}
 """
 
@@ -212,11 +224,52 @@ def create_chart(config: dict) -> str:
     return code
 
 
-def generate_visualization(data: str, visualization_goal: str) -> str:
-    """Generate a visualization based on the data and goal"""
+def execute_visualization_code(code: str, data_str: str, session_id: str) -> Optional[str]:
+    """Execute the visualization code and save to file, return URL path"""
+    try:
+        # Get the original dataset from the session instead of parsing the string
+        session = active_sessions.get(session_id)
+        if not session or "dataset_path" not in session:
+            print("Error: No dataset found in session")
+            return None
+        
+        # Read the full dataset
+        df = pd.read_csv(session["dataset_path"])
+        
+        # Create a new figure
+        plt.figure(figsize=(10, 6))
+        
+        # Execute the visualization code
+        exec_globals = {"df": df, "plt": plt, "pd": pd}
+        exec(code, exec_globals)
+        
+        # Generate unique filename
+        chart_filename = f"chart_{uuid.uuid4()}.png"
+        chart_path = CHARTS_DIR / chart_filename
+        
+        # Save the plot to file
+        plt.savefig(chart_path, format='png', bbox_inches='tight', dpi=100)
+        plt.close('all')  # Close all figures to free memory
+        
+        # Return the URL path
+        return f"/charts/{chart_filename}"
+        
+    except Exception as e:
+        print(f"Error executing visualization code: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def generate_visualization(data: str, visualization_goal: str, session_id: str) -> tuple[str, Optional[str]]:
+    """Generate a visualization based on the data and goal, return code and chart URL"""
     config = extract_chart_config(data, visualization_goal)
     code = create_chart(config)
-    return code
+    
+    # Execute the code to generate and save the image
+    chart_url = execute_visualization_code(code, data, session_id)
+    
+    return code, chart_url
 
 
 # Tool definitions for OpenAI (only used when dataset is available)
@@ -285,23 +338,33 @@ tools = [
 
 def handle_tool_calls(tool_calls, messages, session_id):
     """Execute tools and append results to messages"""
+    chart_urls = []
+    
     tool_implementations = {
         "lookup_given_dataset": lambda **kwargs: lookup_given_dataset(session_id=session_id, **kwargs),
         "analyze_given_dataset": analyze_given_dataset, 
-        "generate_visualization": generate_visualization
+        "generate_visualization": lambda **kwargs: generate_visualization(session_id=session_id, **kwargs)
     }
     
     for tool_call in tool_calls:   
         function = tool_implementations[tool_call.function.name]
         function_args = json.loads(tool_call.function.arguments)
         result = function(**function_args)
+        
+        # Handle visualization results (returns tuple of code and chart URL)
+        if tool_call.function.name == "generate_visualization":
+            code, chart_url = result
+            if chart_url:
+                chart_urls.append(chart_url)
+            result = code  # Store code in messages for reference
+        
         messages.append({
             "role": "tool", 
             "content": result, 
             "tool_call_id": tool_call.id
         })
         
-    return messages
+    return messages, chart_urls
 
 
 def run_agent_with_data(messages, session_id):
@@ -314,6 +377,7 @@ def run_agent_with_data(messages, session_id):
         messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_DATA})
 
     visualization_code = None
+    all_chart_urls = []
     
     while True:
         response = client.chat.completions.create(
@@ -326,15 +390,20 @@ def run_agent_with_data(messages, session_id):
         tool_calls = response.choices[0].message.tool_calls
 
         if tool_calls:
-            # Check if visualization was generated
+            messages, chart_urls = handle_tool_calls(tool_calls, messages, session_id)
+            
+            # Collect all generated chart URLs
+            if chart_urls:
+                all_chart_urls.extend(chart_urls)
+            
+            # Check if visualization was generated (for backward compatibility)
             for tool_call in tool_calls:
                 if tool_call.function.name == "generate_visualization": # type: ignore
                     function_args = json.loads(tool_call.function.arguments) # type: ignore
-                    visualization_code = generate_visualization(**function_args)
-            
-            messages = handle_tool_calls(tool_calls, messages, session_id)
+                    code, _ = generate_visualization(**function_args)
+                    visualization_code = code
         else:
-            return response.choices[0].message.content, visualization_code
+            return response.choices[0].message.content, visualization_code, all_chart_urls
 
 
 def run_agent_general(messages):
@@ -351,7 +420,7 @@ def run_agent_general(messages):
         messages=messages, # type: ignore
     )
     
-    return response.choices[0].message.content, None
+    return response.choices[0].message.content, None, None
 
 
 # API Endpoints
@@ -410,7 +479,7 @@ async def chat(request: ChatRequest):
             session["messages"].append({"role": "user", "content": request.message})
             
             # Run agent with data tools
-            response_text, viz_code = run_agent_with_data(
+            response_text, viz_code, chart_urls = run_agent_with_data(
                 session["messages"].copy(), 
                 request.session_id
             )
@@ -422,6 +491,7 @@ async def chat(request: ChatRequest):
                 session_id=request.session_id,
                 response=response_text, # type: ignore
                 visualization_code=viz_code,
+                chart_urls=chart_urls if chart_urls else None,
                 mode="data_analysis"
             )
         else:
@@ -436,7 +506,7 @@ async def chat(request: ChatRequest):
             temp_session["messages"].append({"role": "user", "content": request.message})
             
             # Run agent in general mode
-            response_text, viz_code = run_agent_general(temp_session["messages"].copy())
+            response_text, viz_code, chart_urls = run_agent_general(temp_session["messages"].copy())
             
             # Update conversation history
             temp_session["messages"].append({"role": "assistant", "content": response_text})
@@ -445,6 +515,7 @@ async def chat(request: ChatRequest):
                 session_id=temp_session_id,
                 response=response_text, # type: ignore
                 visualization_code=viz_code,
+                chart_urls=None,
                 mode="general"
             )
     
@@ -524,7 +595,8 @@ async def root():
             "chat": "POST /chat - Chat with the agent (works with or without data)",
             "create_session": "POST /session/create - Create general session",
             "session": "GET /session/{session_id} - Get session info (data sessions only)",
-            "delete": "DELETE /session/{session_id} - Delete session"
+            "delete": "DELETE /session/{session_id} - Delete session",
+            "charts": "GET /charts/{filename} - Serve generated chart images"
         }
     }
 

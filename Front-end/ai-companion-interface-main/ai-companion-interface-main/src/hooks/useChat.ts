@@ -4,12 +4,14 @@ interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  chartUrls?: string[];
 }
 
 interface ChatResponse {
   session_id: string | null;
   response: string;
   visualization_code: string | null;
+  chart_urls?: string[];
   mode: string;
 }
 
@@ -20,7 +22,7 @@ interface SessionInfo {
   row_count: number;
 }
 
-const API_BASE_URL = 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export function useChat() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -83,10 +85,16 @@ export function useChat() {
 
       const data: ChatResponse = await response.json();
 
+      const chartUrls =
+        Array.isArray(data.chart_urls) && data.chart_urls.length > 0
+          ? data.chart_urls.map((url) => `${API_BASE_URL}${url}`)
+          : undefined;
+
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
         content: data.response,
+        chartUrls,
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
